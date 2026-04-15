@@ -15,9 +15,6 @@ import (
 
 const numWorkers = 8
 
-// filterFrom devuelve el subconjunto de registros (ordenados ascendente) que
-// caen dentro de la ventana temporal desde `from`. Buscamos el primer índice
-// que ya cae dentro de la ventana y devolvemos desde ahí hasta el final.
 func filterFrom(records []pocketbase.PriceRecord, from time.Time) []pocketbase.PriceRecord {
 	for i, r := range records {
 		if !r.FechaMuestreo.Time().Before(from) {
@@ -52,8 +49,19 @@ func durationUntil(hour, min int) time.Duration {
 	return next.Sub(now)
 }
 
+func pbTimeFormat(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05.000Z")
+}
+
+type producerResult struct {
+	sent     int
+	skipped  int
+	fetchErr int
+	errors   []string
+}
+
 func run(pbURL, adminEmail, adminPassword string) {
-	start := time.Now()
+	startTime := time.Now()
 	log.Println("--- Ejecución iniciada ---")
 
 	pb := pocketbase.NewClient(pbURL)
@@ -67,9 +75,39 @@ func run(pbURL, adminEmail, adminPassword string) {
 		return
 	}
 
+	// Crear job con status "running"
+	jobID, err := pb.CreateJob(map[string]any{
+		"type":       "mercadona_stats",
+		"status":     "running",
+		"start_date": pbTimeFormat(startTime),
+		"errors":     []string{},
+		"details":    map[string]any{},
+	})
+	if err != nil {
+		log.Printf("Error creando job: %v (se continúa sin tracking)", err)
+	} else {
+		log.Printf("Job creado: %s", jobID)
+	}
+
+	// Helper para actualizar el job al salir (si se pudo crear)
+	finishJob := func(status string, details map[string]any, jobErrors []string) {
+		if jobID == "" {
+			return
+		}
+		if err := pb.UpdateJob(jobID, map[string]any{
+			"status":   status,
+			"end_date": pbTimeFormat(time.Now()),
+			"details":  details,
+			"errors":   jobErrors,
+		}); err != nil {
+			log.Printf("Error actualizando job: %v", err)
+		}
+	}
+
 	products, err := pb.GetAllProducts()
 	if err != nil {
 		log.Printf("Error obteniendo productos: %v", err)
+		finishJob("failed", map[string]any{}, []string{fmt.Sprintf("get products: %v", err)})
 		return
 	}
 	log.Printf("Productos: %d", len(products))
@@ -77,6 +115,7 @@ func run(pbURL, adminEmail, adminPassword string) {
 	statsIDs, err := pb.GetStatsIdsMap()
 	if err != nil {
 		log.Printf("Error obteniendo stats: %v", err)
+		finishJob("failed", map[string]any{"total_products": len(products)}, []string{fmt.Sprintf("get stats map: %v", err)})
 		return
 	}
 	log.Printf("Stats existentes: %d", len(statsIDs))
@@ -85,11 +124,14 @@ func run(pbURL, adminEmail, adminPassword string) {
 	results := workers.Start(numWorkers, jobs)
 	log.Printf("Pool arrancada con %d workers", numWorkers)
 
+	// Productor — envía stats de vuelta por canal
+	prodDone := make(chan producerResult, 1)
 	go func() {
 		defer close(jobs)
 		now := time.Now()
 		total := len(products)
 		sent, skipped, fetchErr := 0, 0, 0
+		var prodErrors []string
 		for i, p := range products {
 			if i > 0 && i%100 == 0 {
 				log.Printf("[productor] %d/%d (%.0f%%) — enviados=%d sin-historial=%d errores=%d",
@@ -98,6 +140,7 @@ func run(pbURL, adminEmail, adminPassword string) {
 			history, err := pb.GetPriceHistory(p.ID, now.AddDate(0, 0, -365))
 			if err != nil {
 				log.Printf("[productor] error historial %s: %v", p.ID, err)
+				prodErrors = append(prodErrors, fmt.Sprintf("fetch %s: %v", p.ID, err))
 				fetchErr++
 				continue
 			}
@@ -116,13 +159,17 @@ func run(pbURL, adminEmail, adminPassword string) {
 			sent++
 		}
 		log.Printf("[productor] terminado — enviados=%d sin-historial=%d errores=%d", sent, skipped, fetchErr)
+		prodDone <- producerResult{sent, skipped, fetchErr, prodErrors}
 	}()
 
+	// Consumidor
 	ok, fail := 0, 0
+	var upsertErrors []string
 	for stats := range results {
 		stats.ID = statsIDs[stats.ProductID]
 		if err := pb.UpsertStats(&stats); err != nil {
 			log.Printf("[consumidor] error upsert %s: %v", stats.ProductID, err)
+			upsertErrors = append(upsertErrors, fmt.Sprintf("upsert %s: %v", stats.ProductID, err))
 			fail++
 			continue
 		}
@@ -132,8 +179,37 @@ func run(pbURL, adminEmail, adminPassword string) {
 		}
 	}
 
+	// Recoger métricas del productor
+	prod := <-prodDone
+	elapsed := time.Since(startTime)
+
+	// Determinar status del job
+	jobStatus := "completed"
+	if ok == 0 && (fail > 0 || prod.fetchErr > 0) {
+		jobStatus = "failed"
+	} else if fail > 0 || prod.fetchErr > 0 {
+		jobStatus = "completed_with_errors"
+	}
+
+	// Unir errores de productor y consumidor
+	allErrors := make([]string, 0, len(prod.errors)+len(upsertErrors))
+	allErrors = append(allErrors, prod.errors...)
+	allErrors = append(allErrors, upsertErrors...)
+
+	finishJob(jobStatus, map[string]any{
+		"total_products":     len(products),
+		"existing_stats":     len(statsIDs),
+		"products_processed": prod.sent,
+		"products_skipped":   prod.skipped,
+		"fetch_errors":       prod.fetchErr,
+		"upserted":           ok,
+		"upsert_errors":      fail,
+		"num_workers":        numWorkers,
+		"duration_s":         int(elapsed.Seconds()),
+	}, allErrors)
+
 	log.Printf("Completado en %s — upserted=%d errores=%d",
-		time.Since(start).Round(time.Second), ok, fail)
+		elapsed.Round(time.Second), ok, fail)
 }
 
 func main() {

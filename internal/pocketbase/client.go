@@ -291,6 +291,36 @@ func (c *Client) UpsertStats(s *Stats) error {
 	return nil
 }
 
+func (c *Client) CreateJob(data map[string]any) (string, error) {
+	raw, status, err := c.do(http.MethodPost,
+		fmt.Sprintf("%s/api/collections/jobs/records", c.BaseURL), data)
+	if err != nil {
+		return "", err
+	}
+	if status >= 300 {
+		return "", fmt.Errorf("pocketbase: create job status %d: %s", status, raw)
+	}
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return "", fmt.Errorf("pocketbase: decode job: %w", err)
+	}
+	return result.ID, nil
+}
+
+func (c *Client) UpdateJob(id string, data map[string]any) error {
+	raw, status, err := c.do(http.MethodPatch,
+		fmt.Sprintf("%s/api/collections/jobs/records/%s", c.BaseURL, id), data)
+	if err != nil {
+		return err
+	}
+	if status >= 300 {
+		return fmt.Errorf("pocketbase: update job status %d: %s", status, raw)
+	}
+	return nil
+}
+
 func (c *Client) GetStatsIdsMap() (map[string]string, error) {
 	stats, err := fetchAll[Stats](c, "mercadona_stats", nil)
 	if err != nil {
